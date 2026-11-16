@@ -1,0 +1,6 @@
+{
+  "name": "VITAMIN D AI",
+  "description": "Plataforma educativa y asistente científico especializado en vitamina D, bioquímica, metabolismo, análisis de laboratorio y evidencia clínica.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
