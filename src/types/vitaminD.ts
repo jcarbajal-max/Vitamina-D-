@@ -137,7 +137,7 @@ export interface RagLibraryStats {
   configured: boolean;
   totalDocuments: number;
   totalChunks: number;
-  totalPdfInR2: number;
+  totalPagesIndexed: number;
   byCategory: Array<{ category: string; count: number }>;
   byPublicationType: Array<{ publication_type: string; count: number }>;
 }

@@ -10,7 +10,6 @@ import {
   AlertCircle,
   CheckCircle2,
   Database,
-  Download,
   Eye,
   EyeOff,
   FileText,
@@ -28,6 +27,7 @@ import {
   DOCUMENT_CATEGORIES,
   PUBLICATION_TYPES,
   type DocumentCategory,
+  type ExtractedPage,
   type PublicationTypeId,
   type RagDocument,
   type RagLibraryStats,
@@ -66,6 +66,9 @@ const INITIAL_FORM_STATE: MetadataFormState = {
 };
 
 const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
+const MAX_EXTRACTED_CHARS = 1_500_000;
+const BATCH_MAX_PAGES = 15;
+const BATCH_MAX_CHARS = 35_000;
 
 type ProcessingStep =
   | 'idle'
@@ -85,6 +88,73 @@ function suggestTitleFromFilename(filename: string): string {
     .replace(/[_-]+/g, ' ')
     .replace(/\s{2,}/g, ' ')
     .trim();
+}
+
+async function computeSha256Hex(text: string): Promise<string> {
+  if (typeof crypto === 'undefined' || !crypto.subtle) return '';
+  const data = new TextEncoder().encode(text);
+  const digest = await crypto.subtle.digest('SHA-256', data);
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+function buildControlledPageBatches(pages: ExtractedPage[]): ExtractedPage[][] {
+  const normalizedPages: ExtractedPage[] = [];
+
+  for (const page of pages) {
+    if (page.text.length <= BATCH_MAX_CHARS) {
+      normalizedPages.push(page);
+      continue;
+    }
+    // Split oversized single-page text (e.g. long TXT/MD files) safely along paragraph/line breaks
+    let remaining = page.text;
+    while (remaining.length > 0) {
+      if (remaining.length <= BATCH_MAX_CHARS) {
+        normalizedPages.push({ pageNumber: page.pageNumber, text: remaining });
+        break;
+      }
+      let splitAt = remaining.lastIndexOf('\n\n', BATCH_MAX_CHARS);
+      if (splitAt < BATCH_MAX_CHARS * 0.4) {
+        splitAt = remaining.lastIndexOf('\n', BATCH_MAX_CHARS);
+      }
+      if (splitAt < BATCH_MAX_CHARS * 0.4) {
+        splitAt = remaining.lastIndexOf(' ', BATCH_MAX_CHARS);
+      }
+      if (splitAt <= 0) {
+        splitAt = BATCH_MAX_CHARS;
+      }
+      normalizedPages.push({
+        pageNumber: page.pageNumber,
+        text: remaining.slice(0, splitAt).trim(),
+      });
+      remaining = remaining.slice(splitAt).trim();
+    }
+  }
+
+  const batches: ExtractedPage[][] = [];
+  let currentBatch: ExtractedPage[] = [];
+  let currentChars = 0;
+
+  for (const page of normalizedPages) {
+    if (
+      currentBatch.length > 0 &&
+      (currentBatch.length >= BATCH_MAX_PAGES ||
+        currentChars + page.text.length > BATCH_MAX_CHARS)
+    ) {
+      batches.push(currentBatch);
+      currentBatch = [];
+      currentChars = 0;
+    }
+    currentBatch.push(page);
+    currentChars += page.text.length;
+  }
+
+  if (currentBatch.length > 0) {
+    batches.push(currentBatch);
+  }
+
+  return batches;
 }
 
 export function AdminKnowledgeView() {
@@ -109,6 +179,7 @@ export function AdminKnowledgeView() {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [extraction, setExtraction] = useState<DocumentExtractionResult | null>(null);
   const [extractProgress, setExtractProgress] = useState<string>('');
+  const [indexingProgress, setIndexingProgress] = useState<string>('');
   const [processingStep, setProcessingStep] = useState<ProcessingStep>('idle');
   const [submitMessage, setSubmitMessage] = useState<string | null>(null);
   const [submitError, setSubmitError] = useState<string | null>(null);
@@ -117,7 +188,6 @@ export function AdminKnowledgeView() {
 
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
-  const [downloadingId, setDownloadingId] = useState<string | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -331,6 +401,7 @@ export function AdminKnowledgeView() {
     }
 
     setProcessingStep('indexing');
+    setIndexingProgress('');
 
     try {
       const metadataPayload = {
@@ -353,26 +424,123 @@ export function AdminKnowledgeView() {
           selectedFile?.name || editingDoc?.original_filename || '',
       };
 
-      let response: Response;
-
       if (selectedFile && extraction) {
-        const fd = new FormData();
-        fd.append('file', selectedFile);
-        fd.append('metadata', JSON.stringify(metadataPayload));
-        fd.append('pages', JSON.stringify(extraction.pages));
+        if (extraction.totalChars > MAX_EXTRACTED_CHARS) {
+          setProcessingStep('error');
+          setSubmitError(
+            `El texto extraído supera el límite máximo de ${MAX_EXTRACTED_CHARS.toLocaleString('es-ES')} caracteres para mantener la cuota gratuita de Cloudflare.`
+          );
+          return;
+        }
 
-        response = await fetch(
+        const batches = buildControlledPageBatches(extraction.pages);
+        const fullCombinedText = extraction.pages.map((p) => p.text).join('\n\n');
+        const contentHash = await computeSha256Hex(fullCombinedText);
+        const totalBatches = batches.length;
+
+        setIndexingProgress(
+          totalBatches > 1
+            ? `Enviando lote 1 de ${totalBatches} al motor BGE-M3 / Vectorize / D1...`
+            : 'Generando embeddings @cf/baai/bge-m3 (1024 dim) y guardando en Vectorize y D1...'
+        );
+
+        const firstResponse = await fetch(
           editingDoc
             ? `/api/admin/documents/${encodeURIComponent(editingDoc.id)}`
             : '/api/admin/documents',
           {
             method: editingDoc ? 'PUT' : 'POST',
-            headers: { Authorization: `Bearer ${adminToken}` },
-            body: fd,
+            headers: {
+              Authorization: `Bearer ${adminToken}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              metadata: metadataPayload,
+              pages: batches[0],
+              contentHash,
+              totalPageCount: extraction.pageCount,
+              isFinalBatch: totalBatches === 1,
+            }),
           }
         );
+
+        const firstData = (await firstResponse.json().catch(() => ({}))) as {
+          error?: string;
+          chunksIndexed?: number;
+          reindexed?: boolean;
+          document?: RagDocument;
+        };
+
+        if (firstResponse.status === 401) {
+          setAdminToken(null);
+          setAuthError('Sesión administrativa expirada.');
+          return;
+        }
+
+        if (!firstResponse.ok || !firstData.document) {
+          setProcessingStep('error');
+          setSubmitError(firstData.error || 'No se pudo procesar el documento.');
+          return;
+        }
+
+        const targetDocId = firstData.document.id;
+        let totalChunksIndexed = firstData.chunksIndexed ?? 0;
+
+        for (let idx = 1; idx < totalBatches; idx++) {
+          setIndexingProgress(
+            `Enviando lote ${idx + 1} de ${totalBatches} al motor BGE-M3 / Vectorize / D1...`
+          );
+
+          const batchRes = await fetch(
+            `/api/admin/documents/${encodeURIComponent(targetDocId)}/batches`,
+            {
+              method: 'POST',
+              headers: {
+                Authorization: `Bearer ${adminToken}`,
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({
+                pages: batches[idx],
+                isFinalBatch: idx === totalBatches - 1,
+              }),
+            }
+          );
+
+          const batchData = (await batchRes.json().catch(() => ({}))) as {
+            error?: string;
+            chunksAdded?: number;
+            totalChunks?: number;
+          };
+
+          if (!batchRes.ok) {
+            if (!editingDoc) {
+              // Roll back partial newly created document so no incomplete record remains
+              await fetch(`/api/admin/documents/${encodeURIComponent(targetDocId)}`, {
+                method: 'DELETE',
+                headers: { Authorization: `Bearer ${adminToken}` },
+              }).catch(() => undefined);
+            }
+            setProcessingStep('error');
+            setSubmitError(
+              batchData.error ||
+                `Error al procesar el lote ${idx + 1} de ${totalBatches}.`
+            );
+            return;
+          }
+
+          totalChunksIndexed = batchData.totalChunks ?? totalChunksIndexed + (batchData.chunksAdded ?? 0);
+        }
+
+        setProcessingStep('done');
+        setIndexingProgress('');
+        setSubmitMessage(
+          editingDoc
+            ? `Documento actualizado y reindexado correctamente (${totalChunksIndexed} fragmentos vectoriales BGE-M3 en ${totalBatches} ${totalBatches === 1 ? 'lote' : 'lotes'}).`
+            : `Documento indexado correctamente: ${totalChunksIndexed} fragmentos guardados en Vectorize (@cf/baai/bge-m3, 1024 dim) y D1.`
+        );
       } else if (editingDoc) {
-        response = await fetch(
+        setIndexingProgress('Actualizando metadatos bibliográficos en D1...');
+        const response = await fetch(
           `/api/admin/documents/${encodeURIComponent(editingDoc.id)}`,
           {
             method: 'PUT',
@@ -383,39 +551,31 @@ export function AdminKnowledgeView() {
             body: JSON.stringify({ metadata: metadataPayload }),
           }
         );
+
+        const data = (await response.json().catch(() => ({}))) as {
+          error?: string;
+        };
+
+        if (response.status === 401) {
+          setAdminToken(null);
+          setAuthError('Sesión administrativa expirada.');
+          return;
+        }
+
+        if (!response.ok) {
+          setProcessingStep('error');
+          setSubmitError(data.error || 'No se pudieron actualizar los metadatos.');
+          return;
+        }
+
+        setProcessingStep('done');
+        setIndexingProgress('');
+        setSubmitMessage('Metadatos bibliográficos actualizados en D1.');
       } else {
         setProcessingStep('error');
         setSubmitError('Falta el archivo para indexar.');
         return;
       }
-
-      const data = (await response.json().catch(() => ({}))) as {
-        error?: string;
-        chunksIndexed?: number;
-        reindexed?: boolean;
-        document?: RagDocument;
-      };
-
-      if (response.status === 401) {
-        setAdminToken(null);
-        setAuthError('Sesión administrativa expirada.');
-        return;
-      }
-
-      if (!response.ok) {
-        setProcessingStep('error');
-        setSubmitError(data.error || 'No se pudo procesar el documento.');
-        return;
-      }
-
-      setProcessingStep('done');
-      setSubmitMessage(
-        editingDoc
-          ? data.reindexed
-            ? `Documento actualizado y reindexado correctamente (${data.chunksIndexed ?? 0} fragmentos vectoriales BGE-M3).`
-            : 'Metadatos bibliográficos actualizados en D1.'
-          : `Documento indexado correctamente: ${data.chunksIndexed ?? 0} fragmentos guardados en Vectorize (@cf/baai/bge-m3, 1024 dim) y D1.`
-      );
 
       setEditingDoc(null);
       setForm(INITIAL_FORM_STATE);
@@ -427,6 +587,7 @@ export function AdminKnowledgeView() {
       await fetchStatsAndDocs(adminToken, searchQuery, categoryFilter);
     } catch {
       setProcessingStep('error');
+      setIndexingProgress('');
       setSubmitError('Error de red al guardar el documento en Cloudflare Workers.');
     }
   };
@@ -460,42 +621,6 @@ export function AdminKnowledgeView() {
     }
   };
 
-  const handleDownloadOriginal = async (doc: RagDocument) => {
-    if (!adminToken) return;
-    setDownloadingId(doc.id);
-    setListError(null);
-
-    try {
-      const res = await fetch(
-        `/api/admin/documents/${encodeURIComponent(doc.id)}/file`,
-        {
-          headers: { Authorization: `Bearer ${adminToken}` },
-        }
-      );
-
-      if (!res.ok) {
-        const data = (await res.json().catch(() => ({}))) as { error?: string };
-        setListError(data.error || 'No se pudo descargar el archivo desde R2.');
-        return;
-      }
-
-      const blob = await res.blob();
-      const blobUrl = URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = blobUrl;
-      link.download =
-        doc.original_filename || `${doc.id}.${doc.source_format || 'pdf'}`;
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      window.setTimeout(() => URL.revokeObjectURL(blobUrl), 1500);
-    } catch {
-      setListError('Error de red al descargar el archivo original desde R2.');
-    } finally {
-      setDownloadingId(null);
-    }
-  };
-
   // Unauthenticated gate view
   if (!adminToken) {
     return (
@@ -517,9 +642,9 @@ export function AdminKnowledgeView() {
 
           <p className="text-sm text-slate-600 leading-relaxed">
             Esta sección permite cargar, actualizar y eliminar documentos científicos de vitamina D en{' '}
-            <strong>Cloudflare D1</strong>, <strong>R2</strong> y{' '}
+            <strong>Cloudflare D1</strong> y{' '}
             <strong>Vectorize</strong> (<code className="text-xs bg-slate-100 px-1 py-0.5 rounded">@cf/baai/bge-m3</code>).
-            El token se verifica en el Worker y solo permanece en memoria durante la sesión activa.
+            El texto de los PDF se extrae directamente en tu navegador con PDF.js.
           </p>
 
           <form onSubmit={handleVerifyToken} className="space-y-4">
@@ -630,9 +755,9 @@ export function AdminKnowledgeView() {
             </p>
           </div>
           <div className="bg-white rounded-xl border border-slate-200 p-4">
-            <p className="text-xs text-slate-500">Originales en R2</p>
+            <p className="text-xs text-slate-500">Páginas indexadas</p>
             <p className="mt-1 text-2xl font-semibold text-slate-900 tabular-nums">
-              {stats?.totalPdfInR2 ?? 0}
+              {stats?.totalPagesIndexed ?? 0}
             </p>
           </div>
           <div className="bg-white rounded-xl border border-slate-200 p-4">
@@ -650,7 +775,7 @@ export function AdminKnowledgeView() {
           >
             <AlertCircle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
             <p>
-              Algunos bindings de Cloudflare (<strong>DB</strong>, <strong>DOCS_BUCKET</strong> o{' '}
+              Algunos bindings de Cloudflare (<strong>DB</strong> o{' '}
               <strong>VECTOR_INDEX</strong>) aún no están enlazados en el entorno actual. Crea los recursos con Wrangler y aplica <code className="bg-amber-100 px-1 rounded">schema.sql</code> antes de indexar documentos.
             </p>
           </div>
@@ -1001,8 +1126,12 @@ export function AdminKnowledgeView() {
               >
                 <Loader2 className="w-4 h-4 text-blue-700 animate-spin shrink-0" />
                 <span>
-                  Limpiando texto, segmentando fragmentos semánticos, generando embeddings{' '}
-                  <code className="font-mono">@cf/baai/bge-m3</code> (1024 dim) y guardando en Vectorize, D1 y R2...
+                  {indexingProgress || (
+                    <>
+                      Limpiando texto, segmentando fragmentos semánticos, generando embeddings{' '}
+                      <code className="font-mono">@cf/baai/bge-m3</code> (1024 dim) y guardando en Vectorize y D1...
+                    </>
+                  )}
                 </span>
               </div>
             )}
@@ -1078,7 +1207,7 @@ export function AdminKnowledgeView() {
                 Documentos indexados en D1 y Vectorize
               </h3>
               <p className="text-xs text-slate-500">
-                Busca por título, autores, revista, DOI o PMID, descarga originales desde R2 o actualiza registros.
+                Busca por título, autores, revista, DOI o PMID, actualiza metadatos o reindexa documentos.
               </p>
             </div>
 
@@ -1151,7 +1280,6 @@ export function AdminKnowledgeView() {
               {documents.map((doc) => {
                 const isConfirmingDelete = confirmDeleteId === doc.id;
                 const isDeleting = deletingId === doc.id;
-                const isDownloading = downloadingId === doc.id;
 
                 return (
                   <article
@@ -1211,22 +1339,6 @@ export function AdminKnowledgeView() {
                       </div>
 
                       <div className="flex flex-wrap items-center gap-2">
-                        {doc.r2_key && (
-                          <button
-                            type="button"
-                            onClick={() => void handleDownloadOriginal(doc)}
-                            disabled={isDownloading}
-                            className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-60"
-                          >
-                            {isDownloading ? (
-                              <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                            ) : (
-                              <Download className="w-3.5 h-3.5" />
-                            )}
-                            <span>Descargar R2</span>
-                          </button>
-                        )}
-
                         <button
                           type="button"
                           onClick={() => handleStartEdit(doc)}

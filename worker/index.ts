@@ -2,7 +2,6 @@ import type {
   Ai,
   D1Database,
   ExportedHandler,
-  R2Bucket,
   ReadableStream as CfReadableStream,
   Request as CfRequest,
   Response as CfResponse,
@@ -13,6 +12,7 @@ import {
   DOCUMENT_CATEGORIES,
   EMBEDDING_DIMENSIONS,
   PUBLICATION_TYPES,
+  appendDocumentChunks,
   buildSemanticChunks,
   cleanExtractedText,
   createShortDocumentId,
@@ -38,7 +38,6 @@ import {
 export interface Env {
   AI: Ai;
   DB?: D1Database;
-  DOCS_BUCKET?: R2Bucket;
   VECTOR_INDEX?: Vectorize;
   ADMIN_UPLOAD_TOKEN?: string;
 }
@@ -51,7 +50,8 @@ const MAX_TOTAL_CHARS = 24000;
 const MAX_NOTES_CHARS = 1000;
 const MAX_ARRAY_ITEMS = 20;
 const MAX_REQUEST_BYTES = 128 * 1024;
-const MAX_ADMIN_UPLOAD_BYTES = 20 * 1024 * 1024; // 20 MB for PDF/TXT/MD + extracted pages
+const MAX_ADMIN_BATCH_BYTES = 2 * 1024 * 1024; // 2 MB max JSON/text payload per controlled batch
+const MAX_BATCH_TEXT_CHARS = 120_000; // Controlled batch limit to stay well inside free-tier subrequest/CPU budgets
 
 type WorkerAiMessage = {
   role: 'system' | 'user' | 'assistant';
@@ -684,8 +684,9 @@ function requireRagStorageBindings(env: Env): CfResponse | null {
 interface ParsedUploadPayload {
   metadata: DocumentMetadataInput;
   pages: PageTextInput[];
-  fileBuffer: ArrayBuffer | null;
-  fileMimeType: string;
+  contentHash: string;
+  totalPageCount: number | null;
+  isFinalBatch: boolean;
 }
 
 function validateAndNormalizeMetadata(
@@ -827,39 +828,7 @@ async function parseAdminDocumentUpload(
       };
     }
 
-    const uploadedFile = formData.get('file');
-    let fileBuffer: ArrayBuffer | null = null;
-    let fileMimeType = 'application/octet-stream';
-    let fileName = '';
-    let textFromFile = '';
-
-    if (uploadedFile && typeof uploadedFile === 'object' && 'arrayBuffer' in uploadedFile) {
-      const fileObj = uploadedFile as unknown as File;
-      if (fileObj.size > MAX_ADMIN_UPLOAD_BYTES) {
-        return {
-          ok: false,
-          response: jsonResponse(
-            { error: 'El archivo excede el límite máximo de 20 MB.' },
-            413
-          ),
-        };
-      }
-      fileName = fileObj.name || '';
-      fileMimeType = fileObj.type || 'application/octet-stream';
-      fileBuffer = await fileObj.arrayBuffer();
-
-      const lowerName = fileName.toLowerCase();
-      if (lowerName.endsWith('.txt') || lowerName.endsWith('.md') || lowerName.endsWith('.markdown')) {
-        textFromFile = new TextDecoder('utf-8').decode(fileBuffer);
-        if (!metadataObj.sourceFormat) {
-          metadataObj.sourceFormat = lowerName.endsWith('.txt') ? 'txt' : 'md';
-        }
-      } else if (lowerName.endsWith('.pdf')) {
-        metadataObj.sourceFormat = 'pdf';
-      }
-    }
-
-    const metaValidation = validateAndNormalizeMetadata(metadataObj, fileName);
+    const metaValidation = validateAndNormalizeMetadata(metadataObj);
     if (!metaValidation.ok) {
       return {
         ok: false,
@@ -870,6 +839,15 @@ async function parseAdminDocumentUpload(
     let parsedPagesRaw: unknown = null;
     const pagesField = formData.get('pages');
     if (typeof pagesField === 'string' && pagesField.trim()) {
+      if (pagesField.length > MAX_ADMIN_BATCH_BYTES) {
+        return {
+          ok: false,
+          response: jsonResponse(
+            { error: 'El lote de texto excede el tamaño máximo permitido (2 MB).' },
+            413
+          ),
+        };
+      }
       try {
         parsedPagesRaw = JSON.parse(pagesField);
       } catch {
@@ -883,18 +861,24 @@ async function parseAdminDocumentUpload(
     const fullTextField = formData.get('text');
     const pages = normalizePagesPayload(
       parsedPagesRaw,
-      typeof fullTextField === 'string' && fullTextField.trim()
-        ? fullTextField
-        : textFromFile
+      typeof fullTextField === 'string' ? fullTextField : ''
     );
+
+    const rawHash = sanitizeShortText(formData.get('contentHash'), 80).toLowerCase();
+    const contentHash = /^[a-f0-9]{64}$/.test(rawHash) ? rawHash : '';
+    const totalPagesRaw = Number(formData.get('totalPageCount'));
+    const totalPageCount =
+      Number.isInteger(totalPagesRaw) && totalPagesRaw > 0 ? totalPagesRaw : null;
+    const isFinalBatch = formData.get('isFinalBatch') !== 'false';
 
     return {
       ok: true,
       data: {
         metadata: metaValidation.data,
         pages,
-        fileBuffer,
-        fileMimeType,
+        contentHash,
+        totalPageCount,
+        isFinalBatch,
       },
     };
   }
@@ -903,7 +887,10 @@ async function parseAdminDocumentUpload(
     metadata?: Record<string, unknown>;
     pages?: unknown;
     text?: unknown;
-  }>(request, MAX_ADMIN_UPLOAD_BYTES);
+    contentHash?: unknown;
+    totalPageCount?: unknown;
+    isFinalBatch?: unknown;
+  }>(request, MAX_ADMIN_BATCH_BYTES);
   if (!parsed.ok) return parsed;
 
   const metaValidation = validateAndNormalizeMetadata(parsed.data.metadata || {});
@@ -915,13 +902,21 @@ async function parseAdminDocumentUpload(
   }
 
   const pages = normalizePagesPayload(parsed.data.pages, parsed.data.text);
+  const rawHash = sanitizeShortText(parsed.data.contentHash, 80).toLowerCase();
+  const contentHash = /^[a-f0-9]{64}$/.test(rawHash) ? rawHash : '';
+  const totalPagesRaw = Number(parsed.data.totalPageCount);
+  const totalPageCount =
+    Number.isInteger(totalPagesRaw) && totalPagesRaw > 0 ? totalPagesRaw : null;
+  const isFinalBatch = parsed.data.isFinalBatch !== false;
+
   return {
     ok: true,
     data: {
       metadata: metaValidation.data,
       pages,
-      fileBuffer: null,
-      fileMimeType: '',
+      contentHash,
+      totalPageCount,
+      isFinalBatch,
     },
   };
 }
@@ -932,10 +927,10 @@ async function handleAdminStats(env: Env): Promise<CfResponse> {
       configured: false,
       totalDocuments: 0,
       totalChunks: 0,
-      totalPdfInR2: 0,
+      totalPagesIndexed: 0,
       byCategory: [],
       byPublicationType: [],
-      embeddingModel: EMBEDDING_DIMENSIONS,
+      embeddingDimensions: EMBEDDING_DIMENSIONS,
     });
   }
 
@@ -944,9 +939,9 @@ async function handleAdminStats(env: Env): Promise<CfResponse> {
       `SELECT
         COUNT(*) AS total_documents,
         COALESCE(SUM(chunk_count), 0) AS total_chunks,
-        COALESCE(SUM(CASE WHEN r2_key != '' THEN 1 ELSE 0 END), 0) AS total_r2
+        COALESCE(SUM(page_count), 0) AS total_pages
        FROM documents`
-    ).first<{ total_documents: number; total_chunks: number; total_r2: number }>();
+    ).first<{ total_documents: number; total_chunks: number; total_pages: number }>();
 
     const catRes = await env.DB.prepare(
       `SELECT category, COUNT(*) AS count FROM documents GROUP BY category ORDER BY count DESC`
@@ -960,7 +955,7 @@ async function handleAdminStats(env: Env): Promise<CfResponse> {
       configured: true,
       totalDocuments: totals?.total_documents ?? 0,
       totalChunks: totals?.total_chunks ?? 0,
-      totalPdfInR2: totals?.total_r2 ?? 0,
+      totalPagesIndexed: totals?.total_pages ?? 0,
       byCategory: catRes.results ?? [],
       byPublicationType: typeRes.results ?? [],
       categories: DOCUMENT_CATEGORIES,
@@ -1027,7 +1022,7 @@ async function handleAdminCreateDocument(request: CfRequest, env: Env): Promise<
   const parsed = await parseAdminDocumentUpload(request);
   if (!parsed.ok) return parsed.response;
 
-  const { metadata, pages, fileBuffer, fileMimeType } = parsed.data;
+  const { metadata, pages, contentHash: providedHash, totalPageCount, isFinalBatch } = parsed.data;
   if (pages.length === 0) {
     return jsonResponse(
       {
@@ -1039,7 +1034,16 @@ async function handleAdminCreateDocument(request: CfRequest, env: Env): Promise<
   }
 
   const combinedText = pages.map((p) => p.text).join('\n\n');
-  const contentHash = await sha256Hex(combinedText);
+  if (combinedText.length > MAX_BATCH_TEXT_CHARS) {
+    return jsonResponse(
+      {
+        error: `Cada lote de texto no puede superar ${MAX_BATCH_TEXT_CHARS.toLocaleString('es-ES')} caracteres. Envía el documento en lotes más pequeños.`,
+      },
+      413
+    );
+  }
+
+  const contentHash = providedHash || (await sha256Hex(combinedText));
 
   try {
     const duplicate = await findDuplicateDocument(
@@ -1065,7 +1069,7 @@ async function handleAdminCreateDocument(request: CfRequest, env: Env): Promise<
   }
 
   const docId = createShortDocumentId();
-  const chunks = buildSemanticChunks(docId, pages);
+  const chunks = buildSemanticChunks(docId, pages, 1000, 180, 0);
   if (chunks.length === 0) {
     return jsonResponse(
       { error: 'No se pudieron generar fragmentos semánticos válidos del documento.' },
@@ -1075,7 +1079,6 @@ async function handleAdminCreateDocument(request: CfRequest, env: Env): Promise<
 
   const evidenceTier = getEvidenceTierForType(metadata.publicationType);
   const now = new Date().toISOString();
-  let r2Key = '';
   let vectorsUpserted = false;
 
   try {
@@ -1085,24 +1088,7 @@ async function handleAdminCreateDocument(request: CfRequest, env: Env): Promise<
       chunks.map((c) => c.content)
     );
 
-    // 2. Store original file in R2 if provided and bucket is bound
-    if (fileBuffer && env.DOCS_BUCKET) {
-      const ext = metadata.sourceFormat === 'pdf' ? 'pdf' : metadata.sourceFormat === 'md' ? 'md' : 'txt';
-      r2Key = `documents/${docId}/original.${ext}`;
-      await env.DOCS_BUCKET.put(r2Key, fileBuffer, {
-        httpMetadata: {
-          contentType:
-            fileMimeType ||
-            (ext === 'pdf' ? 'application/pdf' : 'text/plain; charset=utf-8'),
-        },
-        customMetadata: {
-          documentId: docId,
-          title: metadata.title.slice(0, 180),
-        },
-      });
-    }
-
-    // 3. Upsert vectors into Vectorize (compact metadata only)
+    // 2. Upsert vectors into Vectorize (compact filter metadata only)
     await upsertChunksToVectorize(
       env.VECTOR_INDEX!,
       chunks,
@@ -1112,7 +1098,7 @@ async function handleAdminCreateDocument(request: CfRequest, env: Env): Promise<
     );
     vectorsUpserted = true;
 
-    // 4. Persist document metadata and full text chunks in D1
+    // 3. Persist document metadata and text chunks permanently in D1 (no R2 dependency)
     const docRow: StoredDocumentRow = {
       id: docId,
       title: metadata.title,
@@ -1129,11 +1115,13 @@ async function handleAdminCreateDocument(request: CfRequest, env: Env): Promise<
       language: metadata.language,
       source_format: metadata.sourceFormat,
       original_filename: metadata.originalFilename,
-      r2_key: r2Key,
+      r2_key: '',
       content_hash: contentHash,
-      page_count: pages.filter((p) => p.pageNumber !== null).length || pages.length,
+      page_count:
+        totalPageCount ??
+        (pages.filter((p) => p.pageNumber !== null).length || pages.length),
       chunk_count: chunks.length,
-      status: 'indexed',
+      status: isFinalBatch ? 'indexed' : 'indexing',
       error_message: '',
       created_at: now,
       updated_at: now,
@@ -1145,12 +1133,10 @@ async function handleAdminCreateDocument(request: CfRequest, env: Env): Promise<
       {
         document: docRow,
         chunksIndexed: chunks.length,
-        r2Stored: Boolean(r2Key),
       },
       201
     );
   } catch (err) {
-    // Rollback R2 & Vectorize if persistence failed
     if (vectorsUpserted) {
       try {
         await deleteVectorsByChunkIds(
@@ -1161,16 +1147,148 @@ async function handleAdminCreateDocument(request: CfRequest, env: Env): Promise<
         // Ignore cleanup failures
       }
     }
-    if (r2Key && env.DOCS_BUCKET) {
+
+    const msg =
+      err instanceof Error ? err.message : 'Error al procesar e indexar el documento.';
+    return jsonResponse({ error: msg }, 500);
+  }
+}
+
+async function handleAdminAppendDocumentBatch(
+  request: CfRequest,
+  env: Env,
+  docId: string
+): Promise<CfResponse> {
+  const missingBindings = requireRagStorageBindings(env);
+  if (missingBindings) return missingBindings;
+
+  const existing = await env.DB!.prepare('SELECT * FROM documents WHERE id = ?1 LIMIT 1')
+    .bind(docId)
+    .first<StoredDocumentRow>();
+
+  if (!existing) {
+    return jsonResponse({ error: 'Documento no encontrado para agregar lote.' }, 404);
+  }
+
+  const parsed = await parseJsonBody<{
+    pages?: unknown;
+    isFinalBatch?: unknown;
+  }>(request, MAX_ADMIN_BATCH_BYTES);
+  if (!parsed.ok) return parsed.response;
+
+  const pages = normalizePagesPayload(parsed.data.pages, undefined);
+  if (pages.length === 0) {
+    return jsonResponse({ error: 'El lote no contiene páginas con texto válido.' }, 400);
+  }
+
+  const batchText = pages.map((p) => p.text).join('\n\n');
+  if (batchText.length > MAX_BATCH_TEXT_CHARS) {
+    return jsonResponse(
+      {
+        error: `Cada lote no puede superar ${MAX_BATCH_TEXT_CHARS.toLocaleString('es-ES')} caracteres.`,
+      },
+      413
+    );
+  }
+
+  const isFinalBatch = parsed.data.isFinalBatch !== false;
+  const maxChunkRes = await env.DB!.prepare(
+    'SELECT COALESCE(MAX(chunk_index), -1) AS max_idx, COUNT(*) AS existing_count FROM document_chunks WHERE document_id = ?1'
+  )
+    .bind(docId)
+    .first<{ max_idx: number; existing_count: number }>();
+
+  const startChunkIndex = (maxChunkRes?.max_idx ?? -1) + 1;
+  const existingCount = maxChunkRes?.existing_count ?? existing.chunk_count;
+
+  const newChunks = buildSemanticChunks(docId, pages, 1000, 180, startChunkIndex);
+  if (newChunks.length === 0) {
+    if (isFinalBatch) {
+      await env.DB!.prepare(
+        `UPDATE documents SET status = 'indexed', updated_at = ?1 WHERE id = ?2`
+      )
+        .bind(new Date().toISOString(), docId)
+        .run();
+    }
+    return jsonResponse({
+      documentId: docId,
+      chunksAdded: 0,
+      totalChunks: existingCount,
+      status: isFinalBatch ? 'indexed' : existing.status,
+    });
+  }
+
+  const metadata: DocumentMetadataInput = {
+    title: existing.title,
+    authors: existing.authors,
+    publicationYear: existing.publication_year,
+    journalOrInstitution: existing.journal_or_institution,
+    doi: existing.doi,
+    pmid: existing.pmid,
+    referenceUrl: existing.reference_url,
+    publicationType: (PUBLICATION_TYPES.some((p) => p.id === existing.publication_type)
+      ? existing.publication_type
+      : 'revision_narrativa') as DocumentMetadataInput['publicationType'],
+    isHistorical: existing.is_historical === 1,
+    category: (DOCUMENT_CATEGORIES.includes(existing.category as DocumentMetadataInput['category'])
+      ? existing.category
+      : 'Investigación científica') as DocumentMetadataInput['category'],
+    language: existing.language || 'es',
+    sourceFormat: (existing.source_format === 'pdf' || existing.source_format === 'md'
+      ? existing.source_format
+      : 'txt'),
+    originalFilename: existing.original_filename,
+  };
+
+  let vectorsUpserted = false;
+  try {
+    const embeddings = await generateBgeM3Embeddings(
+      env.AI,
+      newChunks.map((c) => c.content)
+    );
+
+    await upsertChunksToVectorize(
+      env.VECTOR_INDEX!,
+      newChunks,
+      embeddings,
+      metadata,
+      existing.evidence_tier
+    );
+    vectorsUpserted = true;
+
+    const now = new Date().toISOString();
+    const newTotalChunks = existingCount + newChunks.length;
+    await appendDocumentChunks(
+      env.DB!,
+      docId,
+      newChunks,
+      newTotalChunks,
+      isFinalBatch ? 'indexed' : 'indexing',
+      now
+    );
+
+    const updated = await env.DB!.prepare('SELECT * FROM documents WHERE id = ?1')
+      .bind(docId)
+      .first<StoredDocumentRow>();
+
+    return jsonResponse({
+      document: updated,
+      chunksAdded: newChunks.length,
+      totalChunks: newTotalChunks,
+    });
+  } catch (err) {
+    if (vectorsUpserted) {
       try {
-        await env.DOCS_BUCKET.delete(r2Key);
+        await deleteVectorsByChunkIds(
+          env.VECTOR_INDEX,
+          newChunks.map((c) => c.id)
+        );
       } catch {
         // Ignore cleanup failures
       }
     }
-
     const msg =
-      err instanceof Error ? err.message : 'Error al procesar e indexar el documento.';
+      err instanceof Error ? err.message : 'Error al procesar el lote de fragmentos.';
     return jsonResponse({ error: msg }, 500);
   }
 }
@@ -1198,13 +1316,13 @@ async function handleAdminUpdateDocument(
   const parsed = await parseAdminDocumentUpload(request);
   if (!parsed.ok) return parsed.response;
 
-  const { metadata, pages, fileBuffer, fileMimeType } = parsed.data;
+  const { metadata, pages, contentHash: providedHash, totalPageCount, isFinalBatch } = parsed.data;
   const hasNewContent = pages.length > 0;
   const evidenceTier = getEvidenceTierForType(metadata.publicationType);
   const now = new Date().toISOString();
 
   if (!hasNewContent) {
-    // Metadata-only update: verify no DOI/PMID collision and update D1 + Vectorize metadata
+    // Metadata-only update: verify no DOI/PMID collision and update D1
     const duplicate = await findDuplicateDocument(
       env.DB,
       existing.content_hash,
@@ -1252,12 +1370,21 @@ async function handleAdminUpdateDocument(
     return jsonResponse({ document: updated, reindexed: false });
   }
 
-  // Full re-index with new document text/file
+  // Full re-index with new extracted text (first controlled batch)
   const missingBindings = requireRagStorageBindings(env);
   if (missingBindings) return missingBindings;
 
   const combinedText = pages.map((p) => p.text).join('\n\n');
-  const newHash = await sha256Hex(combinedText);
+  if (combinedText.length > MAX_BATCH_TEXT_CHARS) {
+    return jsonResponse(
+      {
+        error: `Cada lote de texto no puede superar ${MAX_BATCH_TEXT_CHARS.toLocaleString('es-ES')} caracteres.`,
+      },
+      413
+    );
+  }
+
+  const newHash = providedHash || (await sha256Hex(combinedText));
 
   const duplicate = await findDuplicateDocument(
     env.DB,
@@ -1273,7 +1400,7 @@ async function handleAdminUpdateDocument(
     );
   }
 
-  const newChunks = buildSemanticChunks(docId, pages);
+  const newChunks = buildSemanticChunks(docId, pages, 1000, 180, 0);
   if (newChunks.length === 0) {
     return jsonResponse(
       { error: 'No se pudieron extraer fragmentos semánticos del nuevo documento.' },
@@ -1294,30 +1421,6 @@ async function handleAdminUpdateDocument(
       newChunks.map((c) => c.content)
     );
 
-    let r2Key = existing.r2_key;
-    if (fileBuffer && env.DOCS_BUCKET) {
-      if (existing.r2_key) {
-        try {
-          await env.DOCS_BUCKET.delete(existing.r2_key);
-        } catch {
-          // Ignore old file delete error
-        }
-      }
-      const ext = metadata.sourceFormat === 'pdf' ? 'pdf' : metadata.sourceFormat === 'md' ? 'md' : 'txt';
-      r2Key = `documents/${docId}/original.${ext}`;
-      await env.DOCS_BUCKET.put(r2Key, fileBuffer, {
-        httpMetadata: {
-          contentType:
-            fileMimeType ||
-            (ext === 'pdf' ? 'application/pdf' : 'text/plain; charset=utf-8'),
-        },
-        customMetadata: {
-          documentId: docId,
-          title: metadata.title.slice(0, 180),
-        },
-      });
-    }
-
     await deleteVectorsByChunkIds(env.VECTOR_INDEX, oldChunkIds);
     await upsertChunksToVectorize(
       env.VECTOR_INDEX!,
@@ -1334,8 +1437,8 @@ async function handleAdminUpdateDocument(
           title = ?1, authors = ?2, publication_year = ?3, journal_or_institution = ?4,
           doi = ?5, pmid = ?6, reference_url = ?7, publication_type = ?8,
           evidence_tier = ?9, is_historical = ?10, category = ?11, language = ?12,
-          source_format = ?13, original_filename = ?14, r2_key = ?15, content_hash = ?16,
-          page_count = ?17, chunk_count = ?18, status = 'indexed', error_message = '',
+          source_format = ?13, original_filename = ?14, r2_key = '', content_hash = ?15,
+          page_count = ?16, chunk_count = ?17, status = ?18, error_message = '',
           updated_at = ?19
          WHERE id = ?20`
       ).bind(
@@ -1353,10 +1456,11 @@ async function handleAdminUpdateDocument(
         metadata.language,
         metadata.sourceFormat,
         metadata.originalFilename || existing.original_filename,
-        r2Key,
         newHash,
-        pages.filter((p) => p.pageNumber !== null).length || pages.length,
+        totalPageCount ??
+          (pages.filter((p) => p.pageNumber !== null).length || pages.length),
         newChunks.length,
+        isFinalBatch ? 'indexed' : 'indexing',
         now,
         docId
       ),
@@ -1430,14 +1534,6 @@ async function handleAdminDeleteDocument(env: Env, docId: string): Promise<CfRes
   try {
     await deleteVectorsByChunkIds(env.VECTOR_INDEX, chunkIds);
 
-    if (existing.r2_key && env.DOCS_BUCKET) {
-      try {
-        await env.DOCS_BUCKET.delete(existing.r2_key);
-      } catch {
-        // Proceed with DB removal even if R2 object already absent
-      }
-    }
-
     await env.DB.batch([
       env.DB.prepare('DELETE FROM document_chunks WHERE document_id = ?1').bind(docId),
       env.DB.prepare('DELETE FROM documents WHERE id = ?1').bind(docId),
@@ -1449,52 +1545,6 @@ async function handleAdminDeleteDocument(env: Env, docId: string): Promise<CfRes
       err instanceof Error ? err.message : 'No se pudo eliminar el documento.';
     return jsonResponse({ error: msg }, 500);
   }
-}
-
-async function handleAdminDownloadFile(env: Env, docId: string): Promise<CfResponse> {
-  if (!env.DB || !env.DOCS_BUCKET) {
-    return jsonResponse(
-      { error: 'Los bindings D1 o R2 no están configurados.' },
-      503
-    );
-  }
-
-  const doc = await env.DB.prepare(
-    'SELECT r2_key, original_filename, source_format FROM documents WHERE id = ?1 LIMIT 1'
-  )
-    .bind(docId)
-    .first<{ r2_key: string; original_filename: string; source_format: string }>();
-
-  if (!doc || !doc.r2_key) {
-    return jsonResponse(
-      { error: 'El archivo original no está disponible en R2.' },
-      404
-    );
-  }
-
-  const object = await env.DOCS_BUCKET.get(doc.r2_key);
-  if (!object) {
-    return jsonResponse(
-      { error: 'Objeto no encontrado en el bucket R2.' },
-      404
-    );
-  }
-
-  const filename = (doc.original_filename || `documento.${doc.source_format || 'pdf'}`).replace(
-    /["\r\n]/g,
-    '_'
-  );
-
-  return new Response(object.body as unknown as BodyInit, {
-    status: 200,
-    headers: {
-      'Content-Type':
-        object.httpMetadata?.contentType ||
-        (doc.source_format === 'pdf' ? 'application/pdf' : 'text/plain; charset=utf-8'),
-      'Content-Disposition': `attachment; filename="${filename}"`,
-      ...SECURITY_HEADERS,
-    },
-  }) as unknown as CfResponse;
 }
 
 export default {
@@ -1512,7 +1562,6 @@ export default {
         rag: {
           ai: Boolean(env?.AI),
           d1: Boolean(env?.DB),
-          r2: Boolean(env?.DOCS_BUCKET),
           vectorize: Boolean(env?.VECTOR_INDEX),
         },
       });
@@ -1568,14 +1617,14 @@ export default {
         return jsonResponse({ error: 'Método no permitido.' }, 405);
       }
 
-      const fileMatch = /^\/api\/admin\/documents\/([a-zA-Z0-9_-]+)\/file$/.exec(
+      const batchMatch = /^\/api\/admin\/documents\/([a-zA-Z0-9_-]+)\/batches$/.exec(
         url.pathname
       );
-      if (fileMatch) {
-        if (request.method !== 'GET') {
+      if (batchMatch) {
+        if (request.method !== 'POST') {
           return jsonResponse({ error: 'Método no permitido.' }, 405);
         }
-        return handleAdminDownloadFile(env, fileMatch[1]);
+        return handleAdminAppendDocumentBatch(request, env, batchMatch[1]);
       }
 
       const docMatch = /^\/api\/admin\/documents\/([a-zA-Z0-9_-]+)$/.exec(

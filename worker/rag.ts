@@ -1,7 +1,6 @@
 import type {
   Ai,
   D1Database,
-  R2Bucket,
   Vectorize,
   VectorizeVector,
 } from '@cloudflare/workers-types';
@@ -197,11 +196,12 @@ export function buildSemanticChunks(
   docId: string,
   pages: PageTextInput[],
   targetChars = 1000,
-  overlapChars = 180
+  overlapChars = 180,
+  startChunkIndex = 0
 ): DocumentChunkRecord[] {
   const chunks: DocumentChunkRecord[] = [];
   let currentSection = '';
-  let chunkIndex = 0;
+  let chunkIndex = startChunkIndex;
 
   // Build paragraph blocks preserving page numbers and detected headings
   interface Block {
@@ -542,6 +542,50 @@ export async function insertDocumentAndChunks(
   }
 
   // D1 batch supports up to ~100 statements comfortably per batch
+  const batchSize = 50;
+  for (let i = 0; i < statements.length; i += batchSize) {
+    await db.batch(statements.slice(i, i + batchSize));
+  }
+}
+
+export async function appendDocumentChunks(
+  db: D1Database,
+  docId: string,
+  chunks: DocumentChunkRecord[],
+  newTotalChunkCount: number,
+  finalStatus: 'indexing' | 'indexed',
+  updatedAt: string
+): Promise<void> {
+  const statements = chunks.map((chunk) =>
+    db
+      .prepare(
+        `INSERT INTO document_chunks (
+          id, document_id, chunk_index, page_number, section_title,
+          content, char_count, created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)`
+      )
+      .bind(
+        chunk.id,
+        chunk.documentId,
+        chunk.chunkIndex,
+        chunk.pageNumber,
+        chunk.sectionTitle,
+        chunk.content,
+        chunk.charCount,
+        updatedAt
+      )
+  );
+
+  statements.push(
+    db
+      .prepare(
+        `UPDATE documents
+         SET chunk_count = ?1, status = ?2, updated_at = ?3
+         WHERE id = ?4`
+      )
+      .bind(newTotalChunkCount, finalStatus, updatedAt, docId)
+  );
+
   const batchSize = 50;
   for (let i = 0; i < statements.length; i += batchSize) {
     await db.batch(statements.slice(i, i + batchSize));
