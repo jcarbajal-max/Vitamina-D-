@@ -6,6 +6,7 @@
 import { useCallback, useRef, useState } from 'react';
 import {
   BookOpen,
+  Database,
   FlaskConical,
   Menu,
   MessageSquare,
@@ -20,6 +21,7 @@ import { ChatView } from './components/ChatView';
 import { LabAnalyzerView } from './components/LabAnalyzerView';
 import { RiskAssessmentView } from './components/RiskAssessmentView';
 import { LibraryView } from './components/LibraryView';
+import { AdminKnowledgeView } from './components/AdminKnowledgeView';
 
 const NAV_ITEMS: Array<{
   id: AppSection;
@@ -50,6 +52,12 @@ const NAV_ITEMS: Array<{
     label: 'Biblioteca científica',
     shortLabel: 'Biblioteca científica',
     icon: BookOpen,
+  },
+  {
+    id: 'admin',
+    label: 'ADMINISTRAR CONOCIMIENTOS',
+    shortLabel: 'ADMINISTRAR CONOCIMIENTOS',
+    icon: Database,
   },
 ];
 
@@ -414,6 +422,8 @@ export default function App() {
           {activeSection === 'library' && (
             <LibraryView onAskAboutResource={handleAskFromLibrary} />
           )}
+
+          {activeSection === 'admin' && <AdminKnowledgeView />}
         </main>
       </div>
     </div>

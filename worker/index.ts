@@ -1,14 +1,46 @@
 import type {
   Ai,
+  D1Database,
   ExportedHandler,
+  R2Bucket,
   ReadableStream as CfReadableStream,
   Request as CfRequest,
   Response as CfResponse,
+  Vectorize,
 } from '@cloudflare/workers-types';
 import { VITAMIN_D_SYSTEM_INSTRUCTION } from './systemPrompt';
+import {
+  DOCUMENT_CATEGORIES,
+  EMBEDDING_DIMENSIONS,
+  PUBLICATION_TYPES,
+  buildSemanticChunks,
+  cleanExtractedText,
+  createShortDocumentId,
+  deleteVectorsByChunkIds,
+  detectQueryTopicAndRelevance,
+  findDuplicateDocument,
+  formatRagContextForPrompt,
+  generateBgeM3Embeddings,
+  getEvidenceTierForType,
+  insertDocumentAndChunks,
+  isValidCategory,
+  isValidPublicationType,
+  retrieveRelevantRagContext,
+  sha256Hex,
+  timingSafeEqualStrings,
+  upsertChunksToVectorize,
+  type DocumentMetadataInput,
+  type GroundingSource,
+  type PageTextInput,
+  type StoredDocumentRow,
+} from './rag';
 
 export interface Env {
   AI: Ai;
+  DB?: D1Database;
+  DOCS_BUCKET?: R2Bucket;
+  VECTOR_INDEX?: Vectorize;
+  ADMIN_UPLOAD_TOKEN?: string;
 }
 
 const MODEL_NAME = '@cf/google/gemma-4-26b-a4b-it' as const;
@@ -19,6 +51,7 @@ const MAX_TOTAL_CHARS = 24000;
 const MAX_NOTES_CHARS = 1000;
 const MAX_ARRAY_ITEMS = 20;
 const MAX_REQUEST_BYTES = 128 * 1024;
+const MAX_ADMIN_UPLOAD_BYTES = 20 * 1024 * 1024; // 20 MB for PDF/TXT/MD + extracted pages
 
 type WorkerAiMessage = {
   role: 'system' | 'user' | 'assistant';
@@ -83,12 +116,13 @@ function sanitizeStringList(value: unknown, maxItems: number, maxItemLen: number
 }
 
 async function parseJsonBody<T>(
-  request: CfRequest
+  request: CfRequest,
+  maxBytes = MAX_REQUEST_BYTES
 ): Promise<{ ok: true; data: T } | { ok: false; response: CfResponse }> {
   const contentLengthHeader = request.headers.get('content-length');
   if (contentLengthHeader) {
     const contentLength = Number(contentLengthHeader);
-    if (Number.isFinite(contentLength) && contentLength > MAX_REQUEST_BYTES) {
+    if (Number.isFinite(contentLength) && contentLength > maxBytes) {
       return {
         ok: false,
         response: jsonResponse(
@@ -109,7 +143,7 @@ async function parseJsonBody<T>(
     };
   }
 
-  if (rawText.length > MAX_REQUEST_BYTES) {
+  if (rawText.length > maxBytes) {
     return {
       ok: false,
       response: jsonResponse(
@@ -181,11 +215,17 @@ function formatAiErrorMessage(error: unknown): { status: number; message: string
         'Límite de solicitudes alcanzado temporalmente. Espere unos segundos e inténtelo nuevamente.',
     };
   }
-  if (lower.includes('auth') || lower.includes('unauthorized') || lower.includes('401') || lower.includes('403')) {
+  if (
+    lower.includes('auth') ||
+    lower.includes('unauthorized') ||
+    lower.includes('401') ||
+    lower.includes('403') ||
+    lower.includes('remote')
+  ) {
     return {
       status: 503,
       message:
-        'El servicio de inteligencia artificial no está autorizado o disponible en este entorno en este momento.',
+        'El servicio de inteligencia artificial no está disponible o autorizado en este entorno en este momento.',
     };
   }
   return {
@@ -205,7 +245,11 @@ async function runWorkersAiResponse(
   request: CfRequest,
   env: Env,
   conversationMessages: WorkerAiMessage[],
-  bodyStream?: unknown
+  options?: {
+    bodyStream?: unknown;
+    extraSystemContext?: string;
+    sources?: GroundingSource[];
+  }
 ): Promise<CfResponse> {
   if (!env?.AI || typeof env.AI.run !== 'function') {
     return jsonResponse(
@@ -217,12 +261,18 @@ async function runWorkersAiResponse(
     );
   }
 
+  const systemContent = options?.extraSystemContext
+    ? `${VITAMIN_D_SYSTEM_INSTRUCTION}\n\n${options.extraSystemContext}`
+    : VITAMIN_D_SYSTEM_INSTRUCTION;
+
   const fullMessages: WorkerAiMessage[] = [
-    { role: 'system', content: VITAMIN_D_SYSTEM_INSTRUCTION },
+    { role: 'system', content: systemContent },
     ...conversationMessages,
   ];
 
-  if (prefersJsonOnly(request, bodyStream)) {
+  const sources = options?.sources ?? [];
+
+  if (prefersJsonOnly(request, options?.bodyStream)) {
     try {
       const result = await env.AI.run(MODEL_NAME, {
         messages: fullMessages,
@@ -246,6 +296,7 @@ async function runWorkersAiResponse(
         role: 'model',
         text,
         response: text,
+        sources,
       });
     } catch (error) {
       const formatted = formatAiErrorMessage(error);
@@ -327,6 +378,9 @@ async function runWorkersAiResponse(
             message: 'No se recibió respuesta del modelo científico. Inténtelo nuevamente.',
           });
         } else {
+          if (sources.length > 0) {
+            emit({ type: 'sources', sources });
+          }
           emit({ type: 'done' });
         }
       } catch (err) {
@@ -420,7 +474,45 @@ async function handleChat(request: CfRequest, env: Env): Promise<CfResponse> {
     totalChars += msg.content.length;
   }
 
-  return runWorkersAiResponse(request, env, boundedMessages, parsed.data.stream);
+  // 1. Detect topic & enrich short follow-up queries with prior user turn for better retrieval
+  const userMessages = boundedMessages.filter((m) => m.role === 'user');
+  const latestUserQuery = userMessages[userMessages.length - 1]?.content ?? '';
+  const priorUserQuery =
+    userMessages.length > 1 ? userMessages[userMessages.length - 2]?.content ?? '' : '';
+
+  const { isLikelyVitaminDRelated, detectedTopic } = detectQueryTopicAndRelevance(
+    latestUserQuery,
+    userMessages.length > 1
+  );
+
+  const retrievalQuery =
+    latestUserQuery.length < 90 && priorUserQuery
+      ? `${priorUserQuery.slice(0, 220)} ${latestUserQuery}`
+      : latestUserQuery;
+
+  // 2. Execute RAG retrieval (BGE-M3 embedding -> Vectorize -> D1) when query is in domain
+  let extraSystemContext = '';
+  let sources: GroundingSource[] = [];
+
+  if (isLikelyVitaminDRelated && env?.AI) {
+    const ragResult = await retrieveRelevantRagContext(
+      env.AI,
+      env.DB,
+      env.VECTOR_INDEX,
+      retrievalQuery
+    );
+    extraSystemContext = formatRagContextForPrompt(detectedTopic, ragResult.chunks);
+    sources = ragResult.sources;
+  } else if (!isLikelyVitaminDRelated) {
+    extraSystemContext = `[CONTROL DE ESPECIALIZACIÓN]
+La consulta del usuario parece ajena al ámbito científico de la vitamina D. Recházala amablemente recordando que VITAMIN D AI se especializa exclusivamente en vitamina D y orienta al usuario hacia temas relacionados (bioquímica, 25(OH)D, suplementación, salud ósea, nefrología, inmunología o reumatología vinculada a la vitamina D).`;
+  }
+
+  return runWorkersAiResponse(request, env, boundedMessages, {
+    bodyStream: parsed.data.stream,
+    extraSystemContext,
+    sources,
+  });
 }
 
 async function handleLabInterpret(request: CfRequest, env: Env): Promise<CfResponse> {
@@ -477,7 +569,7 @@ Por favor estructura tu explicación educativa en secciones claras:
     request,
     env,
     [{ role: 'user', content: structuredLabPrompt }],
-    body.stream
+    { bodyStream: parsed.data.stream }
   );
 }
 
@@ -528,8 +620,881 @@ Por favor ofrece un análisis científico educativo que incluya:
     request,
     env,
     [{ role: 'user', content: riskPrompt }],
-    body.stream
+    { bodyStream: parsed.data.stream }
   );
+}
+
+// ============================================================================
+// ADMIN AUTHENTICATION & RAG KNOWLEDGE MANAGEMENT (/api/admin/*)
+// ============================================================================
+
+function extractAdminTokenFromRequest(request: CfRequest): string {
+  const auth = request.headers.get('authorization') || '';
+  if (/^bearer\s+/i.test(auth)) {
+    return auth.replace(/^bearer\s+/i, '').trim();
+  }
+  return (request.headers.get('x-admin-token') || '').trim();
+}
+
+function requireAdminAuth(request: CfRequest, env: Env): CfResponse | null {
+  const expectedToken = (env.ADMIN_UPLOAD_TOKEN || '').trim();
+  if (!expectedToken) {
+    return jsonResponse(
+      {
+        error:
+          'El secreto ADMIN_UPLOAD_TOKEN no está configurado en el servidor de Cloudflare Workers.',
+      },
+      503
+    );
+  }
+
+  const providedToken = extractAdminTokenFromRequest(request);
+  if (!providedToken || !timingSafeEqualStrings(providedToken, expectedToken)) {
+    return jsonResponse(
+      { error: 'Token administrativo inválido o no autorizado.' },
+      401
+    );
+  }
+
+  return null;
+}
+
+function requireRagStorageBindings(env: Env): CfResponse | null {
+  if (!env.DB) {
+    return jsonResponse(
+      { error: 'La base de datos Cloudflare D1 (binding DB) no está configurada.' },
+      503
+    );
+  }
+  if (!env.AI || typeof env.AI.run !== 'function') {
+    return jsonResponse(
+      { error: 'El servicio Cloudflare Workers AI (binding AI) no está disponible.' },
+      503
+    );
+  }
+  if (!env.VECTOR_INDEX) {
+    return jsonResponse(
+      { error: 'El índice Cloudflare Vectorize (binding VECTOR_INDEX) no está configurado.' },
+      503
+    );
+  }
+  return null;
+}
+
+interface ParsedUploadPayload {
+  metadata: DocumentMetadataInput;
+  pages: PageTextInput[];
+  fileBuffer: ArrayBuffer | null;
+  fileMimeType: string;
+}
+
+function validateAndNormalizeMetadata(
+  raw: Record<string, unknown>,
+  fallbackFilename = ''
+): { ok: true; data: DocumentMetadataInput } | { ok: false; error: string } {
+  const title = sanitizeShortText(raw.title, 300);
+  const authors = sanitizeShortText(raw.authors, 400);
+  const journalOrInstitution = sanitizeShortText(raw.journalOrInstitution, 240);
+  const doi = sanitizeShortText(raw.doi, 160).replace(/^https?:\/\/(dx\.)?doi\.org\//i, '');
+  const pmid = sanitizeShortText(raw.pmid, 40).replace(/[^\d]/g, '');
+  const referenceUrl = sanitizeShortText(raw.referenceUrl, 500);
+  const category = sanitizeShortText(raw.category, 100);
+  const publicationType = sanitizeShortText(raw.publicationType, 60);
+  const language = sanitizeShortText(raw.language, 20) || 'es';
+  const sourceFormatRaw = sanitizeShortText(raw.sourceFormat, 10).toLowerCase();
+  const originalFilename =
+    sanitizeShortText(raw.originalFilename, 240) || fallbackFilename;
+
+  if (!title) return { ok: false, error: 'El título del documento es obligatorio.' };
+  if (!authors) return { ok: false, error: 'Los autores o institución son obligatorios.' };
+  if (!journalOrInstitution) {
+    return { ok: false, error: 'La revista o institución es obligatoria.' };
+  }
+  if (!isValidCategory(category)) {
+    return { ok: false, error: 'Seleccione una categoría científica válida.' };
+  }
+  if (!isValidPublicationType(publicationType)) {
+    return { ok: false, error: 'Seleccione un tipo de publicación válido.' };
+  }
+  if (referenceUrl && !/^https?:\/\/.+/i.test(referenceUrl)) {
+    return {
+      ok: false,
+      error: 'La URL de referencia debe comenzar con http:// o https://.',
+    };
+  }
+
+  let publicationYear: number | null = null;
+  if (raw.publicationYear !== undefined && raw.publicationYear !== null && String(raw.publicationYear).trim() !== '') {
+    const yearNum = Number(raw.publicationYear);
+    if (!Number.isInteger(yearNum) || yearNum < 1900 || yearNum > 2100) {
+      return { ok: false, error: 'Ingrese un año de publicación válido (1900–2100).' };
+    }
+    publicationYear = yearNum;
+  }
+
+  const sourceFormat: 'pdf' | 'txt' | 'md' =
+    sourceFormatRaw === 'pdf'
+      ? 'pdf'
+      : sourceFormatRaw === 'md' || sourceFormatRaw === 'markdown'
+        ? 'md'
+        : 'txt';
+
+  return {
+    ok: true,
+    data: {
+      title,
+      authors,
+      publicationYear,
+      journalOrInstitution,
+      doi,
+      pmid,
+      referenceUrl,
+      publicationType,
+      isHistorical: Boolean(raw.isHistorical),
+      category,
+      language,
+      sourceFormat,
+      originalFilename,
+    },
+  };
+}
+
+function normalizePagesPayload(
+  rawPages: unknown,
+  rawFullText: unknown
+): PageTextInput[] {
+  if (Array.isArray(rawPages) && rawPages.length > 0) {
+    const pages: PageTextInput[] = [];
+    for (const item of rawPages) {
+      if (!item || typeof item !== 'object') continue;
+      const p = item as { pageNumber?: unknown; text?: unknown };
+      if (typeof p.text !== 'string') continue;
+      const cleaned = cleanExtractedText(p.text);
+      if (!cleaned) continue;
+      const pageNum =
+        typeof p.pageNumber === 'number' && Number.isInteger(p.pageNumber) && p.pageNumber > 0
+          ? p.pageNumber
+          : null;
+      pages.push({ pageNumber: pageNum, text: cleaned });
+    }
+    if (pages.length > 0) return pages;
+  }
+
+  if (typeof rawFullText === 'string' && rawFullText.trim().length > 0) {
+    return [{ pageNumber: null, text: cleanExtractedText(rawFullText) }];
+  }
+
+  return [];
+}
+
+async function parseAdminDocumentUpload(
+  request: CfRequest
+): Promise<{ ok: true; data: ParsedUploadPayload } | { ok: false; response: CfResponse }> {
+  const contentType = (request.headers.get('content-type') || '').toLowerCase();
+
+  if (contentType.includes('multipart/form-data')) {
+    let formData: FormData;
+    try {
+      formData = await (request as unknown as Request).formData();
+    } catch {
+      return {
+        ok: false,
+        response: jsonResponse(
+          { error: 'No se pudo procesar el formulario multipart.' },
+          400
+        ),
+      };
+    }
+
+    const metadataRaw = formData.get('metadata');
+    if (typeof metadataRaw !== 'string') {
+      return {
+        ok: false,
+        response: jsonResponse(
+          { error: 'Faltan los metadatos bibliográficos del documento.' },
+          400
+        ),
+      };
+    }
+
+    let metadataObj: Record<string, unknown>;
+    try {
+      metadataObj = JSON.parse(metadataRaw) as Record<string, unknown>;
+    } catch {
+      return {
+        ok: false,
+        response: jsonResponse({ error: 'Metadatos JSON inválidos.' }, 400),
+      };
+    }
+
+    const uploadedFile = formData.get('file');
+    let fileBuffer: ArrayBuffer | null = null;
+    let fileMimeType = 'application/octet-stream';
+    let fileName = '';
+    let textFromFile = '';
+
+    if (uploadedFile && typeof uploadedFile === 'object' && 'arrayBuffer' in uploadedFile) {
+      const fileObj = uploadedFile as unknown as File;
+      if (fileObj.size > MAX_ADMIN_UPLOAD_BYTES) {
+        return {
+          ok: false,
+          response: jsonResponse(
+            { error: 'El archivo excede el límite máximo de 20 MB.' },
+            413
+          ),
+        };
+      }
+      fileName = fileObj.name || '';
+      fileMimeType = fileObj.type || 'application/octet-stream';
+      fileBuffer = await fileObj.arrayBuffer();
+
+      const lowerName = fileName.toLowerCase();
+      if (lowerName.endsWith('.txt') || lowerName.endsWith('.md') || lowerName.endsWith('.markdown')) {
+        textFromFile = new TextDecoder('utf-8').decode(fileBuffer);
+        if (!metadataObj.sourceFormat) {
+          metadataObj.sourceFormat = lowerName.endsWith('.txt') ? 'txt' : 'md';
+        }
+      } else if (lowerName.endsWith('.pdf')) {
+        metadataObj.sourceFormat = 'pdf';
+      }
+    }
+
+    const metaValidation = validateAndNormalizeMetadata(metadataObj, fileName);
+    if (!metaValidation.ok) {
+      return {
+        ok: false,
+        response: jsonResponse({ error: metaValidation.error }, 400),
+      };
+    }
+
+    let parsedPagesRaw: unknown = null;
+    const pagesField = formData.get('pages');
+    if (typeof pagesField === 'string' && pagesField.trim()) {
+      try {
+        parsedPagesRaw = JSON.parse(pagesField);
+      } catch {
+        return {
+          ok: false,
+          response: jsonResponse({ error: 'Formato de páginas extraídas inválido.' }, 400),
+        };
+      }
+    }
+
+    const fullTextField = formData.get('text');
+    const pages = normalizePagesPayload(
+      parsedPagesRaw,
+      typeof fullTextField === 'string' && fullTextField.trim()
+        ? fullTextField
+        : textFromFile
+    );
+
+    return {
+      ok: true,
+      data: {
+        metadata: metaValidation.data,
+        pages,
+        fileBuffer,
+        fileMimeType,
+      },
+    };
+  }
+
+  const parsed = await parseJsonBody<{
+    metadata?: Record<string, unknown>;
+    pages?: unknown;
+    text?: unknown;
+  }>(request, MAX_ADMIN_UPLOAD_BYTES);
+  if (!parsed.ok) return parsed;
+
+  const metaValidation = validateAndNormalizeMetadata(parsed.data.metadata || {});
+  if (!metaValidation.ok) {
+    return {
+      ok: false,
+      response: jsonResponse({ error: metaValidation.error }, 400),
+    };
+  }
+
+  const pages = normalizePagesPayload(parsed.data.pages, parsed.data.text);
+  return {
+    ok: true,
+    data: {
+      metadata: metaValidation.data,
+      pages,
+      fileBuffer: null,
+      fileMimeType: '',
+    },
+  };
+}
+
+async function handleAdminStats(env: Env): Promise<CfResponse> {
+  if (!env.DB) {
+    return jsonResponse({
+      configured: false,
+      totalDocuments: 0,
+      totalChunks: 0,
+      totalPdfInR2: 0,
+      byCategory: [],
+      byPublicationType: [],
+      embeddingModel: EMBEDDING_DIMENSIONS,
+    });
+  }
+
+  try {
+    const totals = await env.DB.prepare(
+      `SELECT
+        COUNT(*) AS total_documents,
+        COALESCE(SUM(chunk_count), 0) AS total_chunks,
+        COALESCE(SUM(CASE WHEN r2_key != '' THEN 1 ELSE 0 END), 0) AS total_r2
+       FROM documents`
+    ).first<{ total_documents: number; total_chunks: number; total_r2: number }>();
+
+    const catRes = await env.DB.prepare(
+      `SELECT category, COUNT(*) AS count FROM documents GROUP BY category ORDER BY count DESC`
+    ).all<{ category: string; count: number }>();
+
+    const typeRes = await env.DB.prepare(
+      `SELECT publication_type, COUNT(*) AS count FROM documents GROUP BY publication_type ORDER BY count DESC`
+    ).all<{ publication_type: string; count: number }>();
+
+    return jsonResponse({
+      configured: true,
+      totalDocuments: totals?.total_documents ?? 0,
+      totalChunks: totals?.total_chunks ?? 0,
+      totalPdfInR2: totals?.total_r2 ?? 0,
+      byCategory: catRes.results ?? [],
+      byPublicationType: typeRes.results ?? [],
+      categories: DOCUMENT_CATEGORIES,
+      publicationTypes: PUBLICATION_TYPES,
+    });
+  } catch {
+    return jsonResponse(
+      { error: 'No se pudieron consultar las estadísticas en D1. Verifica que schema.sql esté aplicado.' },
+      500
+    );
+  }
+}
+
+async function handleAdminListDocuments(request: CfRequest, env: Env): Promise<CfResponse> {
+  if (!env.DB) {
+    return jsonResponse(
+      { error: 'La base de datos D1 (binding DB) no está configurada.' },
+      503
+    );
+  }
+
+  const url = new URL(request.url);
+  const query = (url.searchParams.get('q') || '').trim().toLowerCase();
+  const category = (url.searchParams.get('category') || '').trim();
+
+  const conditions: string[] = [];
+  const params: string[] = [];
+
+  if (category && category !== 'todas') {
+    params.push(category);
+    conditions.push(`category = ?${params.length}`);
+  }
+  if (query) {
+    params.push(`%${query}%`);
+    const idx = params.length;
+    conditions.push(
+      `(LOWER(title) LIKE ?${idx} OR LOWER(authors) LIKE ?${idx} OR LOWER(journal_or_institution) LIKE ?${idx} OR LOWER(doi) LIKE ?${idx} OR LOWER(pmid) LIKE ?${idx})`
+    );
+  }
+
+  const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+  const sql = `SELECT * FROM documents ${whereClause} ORDER BY created_at DESC LIMIT 200`;
+
+  try {
+    const stmt = env.DB.prepare(sql);
+    const res =
+      params.length > 0
+        ? await stmt.bind(...params).all<StoredDocumentRow>()
+        : await stmt.all<StoredDocumentRow>();
+
+    return jsonResponse({ documents: res.results ?? [] });
+  } catch {
+    return jsonResponse(
+      { error: 'Error al consultar los documentos en D1. Verifica que schema.sql haya sido ejecutado.' },
+      500
+    );
+  }
+}
+
+async function handleAdminCreateDocument(request: CfRequest, env: Env): Promise<CfResponse> {
+  const missingBindings = requireRagStorageBindings(env);
+  if (missingBindings) return missingBindings;
+
+  const parsed = await parseAdminDocumentUpload(request);
+  if (!parsed.ok) return parsed.response;
+
+  const { metadata, pages, fileBuffer, fileMimeType } = parsed.data;
+  if (pages.length === 0) {
+    return jsonResponse(
+      {
+        error:
+          'No se encontró texto extraíble en el documento. Verifica que el PDF no sea solo imagen escaneada sin OCR.',
+      },
+      400
+    );
+  }
+
+  const combinedText = pages.map((p) => p.text).join('\n\n');
+  const contentHash = await sha256Hex(combinedText);
+
+  try {
+    const duplicate = await findDuplicateDocument(
+      env.DB!,
+      contentHash,
+      metadata.doi,
+      metadata.pmid
+    );
+    if (duplicate) {
+      return jsonResponse(
+        {
+          error: `Documento duplicado detectado ("${duplicate.title}"). Ya existe con el mismo contenido, DOI o PMID; utiliza la opción de actualizar si deseas reemplazarlo.`,
+          duplicateId: duplicate.id,
+        },
+        409
+      );
+    }
+  } catch {
+    return jsonResponse(
+      { error: 'No se pudo verificar duplicados en D1. Confirma que schema.sql esté aplicado.' },
+      500
+    );
+  }
+
+  const docId = createShortDocumentId();
+  const chunks = buildSemanticChunks(docId, pages);
+  if (chunks.length === 0) {
+    return jsonResponse(
+      { error: 'No se pudieron generar fragmentos semánticos válidos del documento.' },
+      400
+    );
+  }
+
+  const evidenceTier = getEvidenceTierForType(metadata.publicationType);
+  const now = new Date().toISOString();
+  let r2Key = '';
+  let vectorsUpserted = false;
+
+  try {
+    // 1. Generate BGE-M3 embeddings (1024 dimensions)
+    const embeddings = await generateBgeM3Embeddings(
+      env.AI,
+      chunks.map((c) => c.content)
+    );
+
+    // 2. Store original file in R2 if provided and bucket is bound
+    if (fileBuffer && env.DOCS_BUCKET) {
+      const ext = metadata.sourceFormat === 'pdf' ? 'pdf' : metadata.sourceFormat === 'md' ? 'md' : 'txt';
+      r2Key = `documents/${docId}/original.${ext}`;
+      await env.DOCS_BUCKET.put(r2Key, fileBuffer, {
+        httpMetadata: {
+          contentType:
+            fileMimeType ||
+            (ext === 'pdf' ? 'application/pdf' : 'text/plain; charset=utf-8'),
+        },
+        customMetadata: {
+          documentId: docId,
+          title: metadata.title.slice(0, 180),
+        },
+      });
+    }
+
+    // 3. Upsert vectors into Vectorize (compact metadata only)
+    await upsertChunksToVectorize(
+      env.VECTOR_INDEX!,
+      chunks,
+      embeddings,
+      metadata,
+      evidenceTier
+    );
+    vectorsUpserted = true;
+
+    // 4. Persist document metadata and full text chunks in D1
+    const docRow: StoredDocumentRow = {
+      id: docId,
+      title: metadata.title,
+      authors: metadata.authors,
+      publication_year: metadata.publicationYear,
+      journal_or_institution: metadata.journalOrInstitution,
+      doi: metadata.doi,
+      pmid: metadata.pmid,
+      reference_url: metadata.referenceUrl,
+      publication_type: metadata.publicationType,
+      evidence_tier: evidenceTier,
+      is_historical: metadata.isHistorical ? 1 : 0,
+      category: metadata.category,
+      language: metadata.language,
+      source_format: metadata.sourceFormat,
+      original_filename: metadata.originalFilename,
+      r2_key: r2Key,
+      content_hash: contentHash,
+      page_count: pages.filter((p) => p.pageNumber !== null).length || pages.length,
+      chunk_count: chunks.length,
+      status: 'indexed',
+      error_message: '',
+      created_at: now,
+      updated_at: now,
+    };
+
+    await insertDocumentAndChunks(env.DB!, docRow, chunks);
+
+    return jsonResponse(
+      {
+        document: docRow,
+        chunksIndexed: chunks.length,
+        r2Stored: Boolean(r2Key),
+      },
+      201
+    );
+  } catch (err) {
+    // Rollback R2 & Vectorize if persistence failed
+    if (vectorsUpserted) {
+      try {
+        await deleteVectorsByChunkIds(
+          env.VECTOR_INDEX,
+          chunks.map((c) => c.id)
+        );
+      } catch {
+        // Ignore cleanup failures
+      }
+    }
+    if (r2Key && env.DOCS_BUCKET) {
+      try {
+        await env.DOCS_BUCKET.delete(r2Key);
+      } catch {
+        // Ignore cleanup failures
+      }
+    }
+
+    const msg =
+      err instanceof Error ? err.message : 'Error al procesar e indexar el documento.';
+    return jsonResponse({ error: msg }, 500);
+  }
+}
+
+async function handleAdminUpdateDocument(
+  request: CfRequest,
+  env: Env,
+  docId: string
+): Promise<CfResponse> {
+  if (!env.DB) {
+    return jsonResponse(
+      { error: 'La base de datos D1 (binding DB) no está configurada.' },
+      503
+    );
+  }
+
+  const existing = await env.DB.prepare('SELECT * FROM documents WHERE id = ?1 LIMIT 1')
+    .bind(docId)
+    .first<StoredDocumentRow>();
+
+  if (!existing) {
+    return jsonResponse({ error: 'Documento no encontrado.' }, 404);
+  }
+
+  const parsed = await parseAdminDocumentUpload(request);
+  if (!parsed.ok) return parsed.response;
+
+  const { metadata, pages, fileBuffer, fileMimeType } = parsed.data;
+  const hasNewContent = pages.length > 0;
+  const evidenceTier = getEvidenceTierForType(metadata.publicationType);
+  const now = new Date().toISOString();
+
+  if (!hasNewContent) {
+    // Metadata-only update: verify no DOI/PMID collision and update D1 + Vectorize metadata
+    const duplicate = await findDuplicateDocument(
+      env.DB,
+      existing.content_hash,
+      metadata.doi,
+      metadata.pmid,
+      docId
+    );
+    if (duplicate) {
+      return jsonResponse(
+        { error: `El DOI o PMID ya pertenece a otro documento ("${duplicate.title}").` },
+        409
+      );
+    }
+
+    await env.DB.prepare(
+      `UPDATE documents SET
+        title = ?1, authors = ?2, publication_year = ?3, journal_or_institution = ?4,
+        doi = ?5, pmid = ?6, reference_url = ?7, publication_type = ?8,
+        evidence_tier = ?9, is_historical = ?10, category = ?11, language = ?12,
+        updated_at = ?13
+       WHERE id = ?14`
+    )
+      .bind(
+        metadata.title,
+        metadata.authors,
+        metadata.publicationYear,
+        metadata.journalOrInstitution,
+        metadata.doi,
+        metadata.pmid,
+        metadata.referenceUrl,
+        metadata.publicationType,
+        evidenceTier,
+        metadata.isHistorical ? 1 : 0,
+        metadata.category,
+        metadata.language,
+        now,
+        docId
+      )
+      .run();
+
+    const updated = await env.DB.prepare('SELECT * FROM documents WHERE id = ?1')
+      .bind(docId)
+      .first<StoredDocumentRow>();
+
+    return jsonResponse({ document: updated, reindexed: false });
+  }
+
+  // Full re-index with new document text/file
+  const missingBindings = requireRagStorageBindings(env);
+  if (missingBindings) return missingBindings;
+
+  const combinedText = pages.map((p) => p.text).join('\n\n');
+  const newHash = await sha256Hex(combinedText);
+
+  const duplicate = await findDuplicateDocument(
+    env.DB,
+    newHash,
+    metadata.doi,
+    metadata.pmid,
+    docId
+  );
+  if (duplicate) {
+    return jsonResponse(
+      { error: `El nuevo contenido, DOI o PMID ya existe en "${duplicate.title}".` },
+      409
+    );
+  }
+
+  const newChunks = buildSemanticChunks(docId, pages);
+  if (newChunks.length === 0) {
+    return jsonResponse(
+      { error: 'No se pudieron extraer fragmentos semánticos del nuevo documento.' },
+      400
+    );
+  }
+
+  const oldChunksRes = await env.DB.prepare(
+    'SELECT id FROM document_chunks WHERE document_id = ?1'
+  )
+    .bind(docId)
+    .all<{ id: string }>();
+  const oldChunkIds = (oldChunksRes.results ?? []).map((r) => r.id);
+
+  try {
+    const embeddings = await generateBgeM3Embeddings(
+      env.AI,
+      newChunks.map((c) => c.content)
+    );
+
+    let r2Key = existing.r2_key;
+    if (fileBuffer && env.DOCS_BUCKET) {
+      if (existing.r2_key) {
+        try {
+          await env.DOCS_BUCKET.delete(existing.r2_key);
+        } catch {
+          // Ignore old file delete error
+        }
+      }
+      const ext = metadata.sourceFormat === 'pdf' ? 'pdf' : metadata.sourceFormat === 'md' ? 'md' : 'txt';
+      r2Key = `documents/${docId}/original.${ext}`;
+      await env.DOCS_BUCKET.put(r2Key, fileBuffer, {
+        httpMetadata: {
+          contentType:
+            fileMimeType ||
+            (ext === 'pdf' ? 'application/pdf' : 'text/plain; charset=utf-8'),
+        },
+        customMetadata: {
+          documentId: docId,
+          title: metadata.title.slice(0, 180),
+        },
+      });
+    }
+
+    await deleteVectorsByChunkIds(env.VECTOR_INDEX, oldChunkIds);
+    await upsertChunksToVectorize(
+      env.VECTOR_INDEX!,
+      newChunks,
+      embeddings,
+      metadata,
+      evidenceTier
+    );
+
+    const statements = [
+      env.DB.prepare('DELETE FROM document_chunks WHERE document_id = ?1').bind(docId),
+      env.DB.prepare(
+        `UPDATE documents SET
+          title = ?1, authors = ?2, publication_year = ?3, journal_or_institution = ?4,
+          doi = ?5, pmid = ?6, reference_url = ?7, publication_type = ?8,
+          evidence_tier = ?9, is_historical = ?10, category = ?11, language = ?12,
+          source_format = ?13, original_filename = ?14, r2_key = ?15, content_hash = ?16,
+          page_count = ?17, chunk_count = ?18, status = 'indexed', error_message = '',
+          updated_at = ?19
+         WHERE id = ?20`
+      ).bind(
+        metadata.title,
+        metadata.authors,
+        metadata.publicationYear,
+        metadata.journalOrInstitution,
+        metadata.doi,
+        metadata.pmid,
+        metadata.referenceUrl,
+        metadata.publicationType,
+        evidenceTier,
+        metadata.isHistorical ? 1 : 0,
+        metadata.category,
+        metadata.language,
+        metadata.sourceFormat,
+        metadata.originalFilename || existing.original_filename,
+        r2Key,
+        newHash,
+        pages.filter((p) => p.pageNumber !== null).length || pages.length,
+        newChunks.length,
+        now,
+        docId
+      ),
+    ];
+
+    for (const chunk of newChunks) {
+      statements.push(
+        env.DB.prepare(
+          `INSERT INTO document_chunks (
+            id, document_id, chunk_index, page_number, section_title,
+            content, char_count, created_at
+          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)`
+        ).bind(
+          chunk.id,
+          chunk.documentId,
+          chunk.chunkIndex,
+          chunk.pageNumber,
+          chunk.sectionTitle,
+          chunk.content,
+          chunk.charCount,
+          now
+        )
+      );
+    }
+
+    const batchSize = 50;
+    for (let i = 0; i < statements.length; i += batchSize) {
+      await env.DB.batch(statements.slice(i, i + batchSize));
+    }
+
+    const updated = await env.DB.prepare('SELECT * FROM documents WHERE id = ?1')
+      .bind(docId)
+      .first<StoredDocumentRow>();
+
+    return jsonResponse({
+      document: updated,
+      reindexed: true,
+      chunksIndexed: newChunks.length,
+    });
+  } catch (err) {
+    const msg =
+      err instanceof Error ? err.message : 'Error al actualizar y reindexar el documento.';
+    return jsonResponse({ error: msg }, 500);
+  }
+}
+
+async function handleAdminDeleteDocument(env: Env, docId: string): Promise<CfResponse> {
+  if (!env.DB) {
+    return jsonResponse(
+      { error: 'La base de datos D1 (binding DB) no está configurada.' },
+      503
+    );
+  }
+
+  const existing = await env.DB.prepare('SELECT * FROM documents WHERE id = ?1 LIMIT 1')
+    .bind(docId)
+    .first<StoredDocumentRow>();
+
+  if (!existing) {
+    return jsonResponse({ error: 'Documento no encontrado.' }, 404);
+  }
+
+  const chunkRes = await env.DB.prepare(
+    'SELECT id FROM document_chunks WHERE document_id = ?1'
+  )
+    .bind(docId)
+    .all<{ id: string }>();
+
+  const chunkIds = (chunkRes.results ?? []).map((r) => r.id);
+
+  try {
+    await deleteVectorsByChunkIds(env.VECTOR_INDEX, chunkIds);
+
+    if (existing.r2_key && env.DOCS_BUCKET) {
+      try {
+        await env.DOCS_BUCKET.delete(existing.r2_key);
+      } catch {
+        // Proceed with DB removal even if R2 object already absent
+      }
+    }
+
+    await env.DB.batch([
+      env.DB.prepare('DELETE FROM document_chunks WHERE document_id = ?1').bind(docId),
+      env.DB.prepare('DELETE FROM documents WHERE id = ?1').bind(docId),
+    ]);
+
+    return jsonResponse({ deleted: true, id: docId, deletedChunks: chunkIds.length });
+  } catch (err) {
+    const msg =
+      err instanceof Error ? err.message : 'No se pudo eliminar el documento.';
+    return jsonResponse({ error: msg }, 500);
+  }
+}
+
+async function handleAdminDownloadFile(env: Env, docId: string): Promise<CfResponse> {
+  if (!env.DB || !env.DOCS_BUCKET) {
+    return jsonResponse(
+      { error: 'Los bindings D1 o R2 no están configurados.' },
+      503
+    );
+  }
+
+  const doc = await env.DB.prepare(
+    'SELECT r2_key, original_filename, source_format FROM documents WHERE id = ?1 LIMIT 1'
+  )
+    .bind(docId)
+    .first<{ r2_key: string; original_filename: string; source_format: string }>();
+
+  if (!doc || !doc.r2_key) {
+    return jsonResponse(
+      { error: 'El archivo original no está disponible en R2.' },
+      404
+    );
+  }
+
+  const object = await env.DOCS_BUCKET.get(doc.r2_key);
+  if (!object) {
+    return jsonResponse(
+      { error: 'Objeto no encontrado en el bucket R2.' },
+      404
+    );
+  }
+
+  const filename = (doc.original_filename || `documento.${doc.source_format || 'pdf'}`).replace(
+    /["\r\n]/g,
+    '_'
+  );
+
+  return new Response(object.body as unknown as BodyInit, {
+    status: 200,
+    headers: {
+      'Content-Type':
+        object.httpMetadata?.contentType ||
+        (doc.source_format === 'pdf' ? 'application/pdf' : 'text/plain; charset=utf-8'),
+      'Content-Disposition': `attachment; filename="${filename}"`,
+      ...SECURITY_HEADERS,
+    },
+  }) as unknown as CfResponse;
 }
 
 export default {
@@ -544,6 +1509,12 @@ export default {
         status: 'ok',
         service: 'VITAMIN D AI',
         runtime: 'cloudflare-workers',
+        rag: {
+          ai: Boolean(env?.AI),
+          d1: Boolean(env?.DB),
+          r2: Boolean(env?.DOCS_BUCKET),
+          vectorize: Boolean(env?.VECTOR_INDEX),
+        },
       });
     }
 
@@ -566,6 +1537,61 @@ export default {
         return jsonResponse({ error: 'Método no permitido.' }, 405);
       }
       return handleRiskInterpret(request, env);
+    }
+
+    // Protected Admin RAG routes (/api/admin/*)
+    if (url.pathname.startsWith('/api/admin/')) {
+      const authError = requireAdminAuth(request, env);
+      if (authError) return authError;
+
+      if (url.pathname === '/api/admin/verify') {
+        if (request.method !== 'GET') {
+          return jsonResponse({ error: 'Método no permitido.' }, 405);
+        }
+        return jsonResponse({ authenticated: true });
+      }
+
+      if (url.pathname === '/api/admin/stats') {
+        if (request.method !== 'GET') {
+          return jsonResponse({ error: 'Método no permitido.' }, 405);
+        }
+        return handleAdminStats(env);
+      }
+
+      if (url.pathname === '/api/admin/documents') {
+        if (request.method === 'GET') {
+          return handleAdminListDocuments(request, env);
+        }
+        if (request.method === 'POST') {
+          return handleAdminCreateDocument(request, env);
+        }
+        return jsonResponse({ error: 'Método no permitido.' }, 405);
+      }
+
+      const fileMatch = /^\/api\/admin\/documents\/([a-zA-Z0-9_-]+)\/file$/.exec(
+        url.pathname
+      );
+      if (fileMatch) {
+        if (request.method !== 'GET') {
+          return jsonResponse({ error: 'Método no permitido.' }, 405);
+        }
+        return handleAdminDownloadFile(env, fileMatch[1]);
+      }
+
+      const docMatch = /^\/api\/admin\/documents\/([a-zA-Z0-9_-]+)$/.exec(
+        url.pathname
+      );
+      if (docMatch) {
+        if (request.method === 'PUT') {
+          return handleAdminUpdateDocument(request, env, docMatch[1]);
+        }
+        if (request.method === 'DELETE') {
+          return handleAdminDeleteDocument(env, docMatch[1]);
+        }
+        return jsonResponse({ error: 'Método no permitido.' }, 405);
+      }
+
+      return jsonResponse({ error: 'Endpoint administrativo no encontrado.' }, 404);
     }
 
     if (url.pathname.startsWith('/api/')) {
